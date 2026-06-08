@@ -16,7 +16,18 @@ from nav_msgs.msg import Odometry
 
 
 class WalkForwardSteps(Node):
-    def __init__(self, steps, step_duration, odom_topic, pose_log_interval):
+    def __init__(
+        self,
+        odom_topic,
+        target_x,
+        target_y,
+        target_yaw_deg,
+        forward_speed,
+        turn_speed,
+        distance_kp,
+        heading_kp,
+        pose_log_interval,
+    ):
         super().__init__("walk_forward_steps")
         self.publisher = self.create_publisher(
             McLocomotionVelocity, "/aima/mc/locomotion/velocity", 10
@@ -38,12 +49,25 @@ class WalkForwardSteps(Node):
             Odometry, odom_topic, self.on_odom, odom_qos
         )
 
-        self.steps = steps
-        self.step_duration = step_duration
-        self.forward_velocity = 0.5  # m/s
+        self.source = "node"
         self.odom_topic = odom_topic
-        self.pose_log_interval = pose_log_interval
+        self.target_x = float(target_x)
+        self.target_y = float(target_y)
+        self.target_yaw = math.radians(float(target_yaw_deg))
+        self.forward_speed = float(forward_speed)
+        self.turn_speed = float(turn_speed)
+        self.distance_kp = float(distance_kp)
+        self.heading_kp = float(heading_kp)
+        self.pose_log_interval = float(pose_log_interval)
         self.last_pose_log_time = 0.0
+
+        self.max_heading_correction = 0.35
+        self.max_distance_speed = self.forward_speed
+        self.min_distance_speed = 0.05
+        self.max_turn_speed = self.turn_speed
+        self.min_turn_speed = 0.10
+        self.position_tolerance = 0.03
+        self.angle_tolerance = math.radians(2.0)
 
         self.odom_ready = False
         self.x = 0.0
@@ -93,8 +117,8 @@ class WalkForwardSteps(Node):
             self.get_logger().info("Waiting for input source service...")
 
         req = SetMcInputSource.Request()
-        req.action.value = 1001  # INPUTACTION_ADD
-        req.input_source.name = "node"
+        req.action.value = 1001
+        req.input_source.name = self.source
         req.input_source.priority = 40
         req.input_source.timeout = 1000
 
@@ -168,44 +192,149 @@ class WalkForwardSteps(Node):
     def set_locomotion_mode(self):
         return self.set_mode("LOCOMOTION_DEFAULT")
 
-    def publish_velocity(self):
+    def publish_velocity(self, forward=0.0, lateral=0.0, angular=0.0):
         msg = McLocomotionVelocity()
         msg.header = MessageHeader()
         msg.header.stamp = self.get_clock().now().to_msg()
-        msg.source = "node"
-        msg.forward_velocity = self.forward_velocity
-        msg.lateral_velocity = 0.0
-        msg.angular_velocity = 0.0
+        msg.source = self.source
+        msg.forward_velocity = float(forward)
+        msg.lateral_velocity = float(lateral)
+        msg.angular_velocity = float(angular)
         self.publisher.publish(msg)
 
-    def walk_for_steps(self, steps):
-        total_duration = steps * self.step_duration
+    @staticmethod
+    def normalize_angle(angle):
+        while angle > math.pi:
+            angle -= 2.0 * math.pi
+        while angle < -math.pi:
+            angle += 2.0 * math.pi
+        return angle
+
+    def turn_to_heading(self, target_heading):
         self.last_pose_log_time = 0.0
         self.get_logger().info(
-            f"Walking estimated {steps:.2f} steps: velocity={self.forward_velocity:.2f} m/s, "
-            f"step_duration={self.step_duration:.2f}s, total_duration={total_duration:.2f}s"
+            f"Turning to heading {math.degrees(target_heading):.1f} deg"
         )
 
-        start = time.monotonic()
-        while rclpy.ok() and time.monotonic() - start < total_duration:
-            self.publish_velocity()
+        while rclpy.ok():
             rclpy.spin_once(self, timeout_sec=0.02)
+            error = self.normalize_angle(target_heading - self.yaw)
+            if abs(error) <= self.angle_tolerance:
+                break
+
+            angular = max(
+                self.min_turn_speed,
+                min(self.max_turn_speed, abs(error) * self.heading_kp),
+            )
+            if error < 0.0:
+                angular = -angular
+
+            self.publish_velocity(angular=angular)
             self.maybe_log_pose()
             time.sleep(0.02)
 
         self.stop()
-        self.log_pose(prefix="Final pose")
-        self.get_logger().info("Finished walking estimated steps, robot stopped")
+        self.log_pose(prefix="Heading aligned")
 
-    def stop(self):
-        msg = McLocomotionVelocity()
-        msg.header = MessageHeader()
-        msg.header.stamp = self.get_clock().now().to_msg()
-        msg.source = "node"
-        msg.forward_velocity = 0.0
-        msg.lateral_velocity = 0.0
-        msg.angular_velocity = 0.0
-        self.publisher.publish(msg)
+    def drive_axis_to_target(self, axis_name, target_value, target_heading):
+        self.last_pose_log_time = 0.0
+        start_error = (
+            target_value - self.y if axis_name == "y" else target_value - self.x
+        )
+        previous_error = start_error
+
+        self.get_logger().info(
+            f"Driving axis {axis_name} toward {target_value:.3f} with heading {math.degrees(target_heading):.1f} deg"
+        )
+
+        stop_reason = "tolerance"
+        while rclpy.ok():
+            rclpy.spin_once(self, timeout_sec=0.02)
+
+            current_value = self.y if axis_name == "y" else self.x
+            error = target_value - current_value
+
+            if abs(error) <= self.position_tolerance:
+                stop_reason = "tolerance"
+                break
+
+            if start_error != 0.0 and previous_error != 0.0 and error * previous_error < 0.0:
+                stop_reason = "crossing"
+                break
+
+            heading_error = self.normalize_angle(target_heading - self.yaw)
+            angular = max(
+                -self.max_heading_correction,
+                min(self.max_heading_correction, self.heading_kp * heading_error),
+            )
+            forward = max(
+                self.min_distance_speed,
+                min(self.max_distance_speed, self.distance_kp * abs(error)),
+            )
+
+            self.publish_velocity(forward=forward, angular=angular)
+            self.maybe_log_pose()
+            previous_error = error
+            time.sleep(0.02)
+
+        self.stop()
+        final_value = self.y if axis_name == "y" else self.x
+        final_error = target_value - final_value
+        self.get_logger().info(
+            f"Segment finished on axis {axis_name}: value={final_value:.3f}, "
+            f"target={target_value:.3f}, error={final_error:.3f}, stop_reason={stop_reason}"
+        )
+
+    def move_to_target(self):
+        self.log_pose(prefix="Start pose")
+
+        dx = self.target_x - self.x
+        dy = self.target_y - self.y
+
+        self.get_logger().info(
+            f"Target point: x={self.target_x:.3f}, y={self.target_y:.3f}, dx={dx:.3f}, dy={dy:.3f}"
+        )
+
+        if abs(dy) > self.position_tolerance:
+            y_heading = math.pi / 2.0 if dy >= 0.0 else -math.pi / 2.0
+            self.get_logger().info(
+                f"Stage 1: correct y by {dy:.3f} m with heading {math.degrees(y_heading):.1f} deg"
+            )
+            self.turn_to_heading(y_heading)
+            self.drive_axis_to_target("y", self.target_y, y_heading)
+
+        dx_after = self.target_x - self.x
+        dy_after = self.target_y - self.y
+        self.get_logger().info(
+            f"After stage 1: dx={dx_after:.3f}, dy={dy_after:.3f}"
+        )
+
+        if abs(dx_after) > self.position_tolerance:
+            x_heading = 0.0 if dx_after >= 0.0 else math.pi
+            self.get_logger().info(
+                f"Stage 2: correct x by {dx_after:.3f} m with heading {math.degrees(x_heading):.1f} deg"
+            )
+            self.turn_to_heading(x_heading)
+            self.drive_axis_to_target("x", self.target_x, x_heading)
+
+        self.get_logger().info(
+            f"Stage 3: turn to final heading {math.degrees(self.target_yaw):.1f} deg"
+        )
+        self.turn_to_heading(self.target_yaw)
+
+        final_dx = self.target_x - self.x
+        final_dy = self.target_y - self.y
+        self.stop()
+        self.get_logger().info(
+            f"Navigation finished: final x={self.x:.3f}, y={self.y:.3f}, "
+            f"error dx={final_dx:.3f}, dy={final_dy:.3f}"
+        )
+
+    def stop(self, repeats=10):
+        for _ in range(repeats):
+            self.publish_velocity(0.0, 0.0, 0.0)
+            rclpy.spin_once(self, timeout_sec=0.01)
+            time.sleep(0.02)
 
 
 _global_node = None
@@ -223,7 +352,9 @@ def _signal_handler(sig, _frame):
 
 
 def _parse_args():
-    parser = argparse.ArgumentParser(description="Walk forward specified number of estimated steps")
+    parser = argparse.ArgumentParser(
+        description="Closed-loop navigation to a target point using odometry"
+    )
     parser.add_argument(
         "--no-reset-prompt",
         action="store_true",
@@ -235,58 +366,61 @@ def _parse_args():
         default=1.5,
         help="Seconds to wait after Reset before switching to locomotion",
     )
-    parser.add_argument("--steps", type=float, default=10.0, help="Estimated step count to walk in non-interactive mode")
-    parser.add_argument("--step-duration", type=float, default=0.8, help="Duration of each estimated step in seconds")
-    parser.add_argument("--velocity", type=float, default=0.5, help="Forward velocity in m/s")
-    parser.add_argument(
-        "--interactive",
-        action="store_true",
-        help="Prompt repeatedly for step counts; input q or blank line to quit",
-    )
     parser.add_argument(
         "--odom-topic",
         type=str,
         default="/aima/hal/odom/state",
-        help="Odometry topic used for real-time pose printing",
+        help="Odometry topic used for closed-loop feedback",
+    )
+    parser.add_argument(
+        "--target-x",
+        type=float,
+        default=-0.020,
+        help="Target x position in map frame",
+    )
+    parser.add_argument(
+        "--target-y",
+        type=float,
+        default=1.745,
+        help="Target y position in map frame",
+    )
+    parser.add_argument(
+        "--target-yaw-deg",
+        type=float,
+        default=-90.0,
+        help="Final target yaw in degrees after reaching the target point",
+    )
+    parser.add_argument(
+        "--forward-speed",
+        type=float,
+        default=0.25,
+        help="Maximum forward speed in m/s",
+    )
+    parser.add_argument(
+        "--turn-speed",
+        type=float,
+        default=0.35,
+        help="Maximum turn speed in rad/s",
+    )
+    parser.add_argument(
+        "--distance-kp",
+        type=float,
+        default=0.6,
+        help="Proportional gain for distance control",
+    )
+    parser.add_argument(
+        "--heading-kp",
+        type=float,
+        default=1.2,
+        help="Proportional gain for heading control",
     )
     parser.add_argument(
         "--pose-log-interval",
         type=float,
         default=0.5,
-        help="Seconds between pose logs while walking",
+        help="Seconds between pose logs while moving",
     )
     return parser.parse_args()
-
-
-def _interactive_loop(node):
-    print(
-        "\nInteractive mode is active. Enter an estimated step count to walk forward.\n"
-        "Examples: 1, 2, 3.5\n"
-        "Enter q or press Enter on an empty line to quit.\n",
-        flush=True,
-    )
-
-    while rclpy.ok():
-        try:
-            raw = input("Estimated steps> ").strip()
-        except EOFError:
-            print()
-            break
-
-        if raw == "" or raw.lower() == "q":
-            break
-
-        try:
-            steps = float(raw)
-        except ValueError:
-            print("Invalid input. Please enter a number, q, or blank line.", flush=True)
-            continue
-
-        if steps <= 0.0:
-            print("Please enter a positive number of estimated steps.", flush=True)
-            continue
-
-        node.walk_for_steps(steps)
 
 
 def main():
@@ -296,9 +430,14 @@ def main():
 
     rclpy.init()
     node = WalkForwardSteps(
-        args.steps,
-        args.step_duration,
         args.odom_topic,
+        args.target_x,
+        args.target_y,
+        args.target_yaw_deg,
+        args.forward_speed,
+        args.turn_speed,
+        args.distance_kp,
+        args.heading_kp,
         args.pose_log_interval,
     )
     _global_node = node
@@ -306,7 +445,6 @@ def main():
     signal.signal(signal.SIGINT, _signal_handler)
     signal.signal(signal.SIGTERM, _signal_handler)
 
-    # Set stand mode first, matching simulator startup flow in reference examples.
     if not node.set_mode("STAND_DEFAULT"):
         node.get_logger().error("Failed to set stand mode, exiting")
         if rclpy.ok():
@@ -324,14 +462,12 @@ def main():
 
     time.sleep(args.stand_time)
 
-    # Register input source
     if not node.register_input_source():
         node.get_logger().error("Input source registration failed, exiting")
         if rclpy.ok():
             rclpy.shutdown()
         return
 
-    # Set locomotion mode
     if not node.set_locomotion_mode():
         node.get_logger().error("Failed to set locomotion mode, exiting")
         if rclpy.ok():
@@ -343,14 +479,8 @@ def main():
             rclpy.shutdown()
         return
 
-    # Set forward velocity based on argument
-    node.forward_velocity = args.velocity
-
     try:
-        if args.interactive:
-            _interactive_loop(node)
-        else:
-            node.walk_for_steps(args.steps)
+        node.move_to_target()
     finally:
         node.stop()
         if rclpy.ok():
