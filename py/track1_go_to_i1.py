@@ -8,6 +8,7 @@ import time
 
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import QoSDurabilityPolicy, QoSProfile, QoSReliabilityPolicy
 
 from aimdk_msgs.msg import (
     CommonState,
@@ -19,12 +20,16 @@ from aimdk_msgs.msg import (
 )
 from aimdk_msgs.srv import SetMcAction, SetMcInputSource
 from geometry_msgs.msg import PoseStamped
+from nav_msgs.msg import Odometry
 
 
 TASK_REQUEST_START = 1
 TASK_REQUEST_STOP = 2
 TASK_TYPE_PLANNING_NAVI_TO_POSE_2D = 2
 PNC_MODE_NORMAL = 0
+SCENE_START_X = -1.5
+SCENE_START_Y = -1.5
+SCENE_START_YAW = 1.57
 
 
 class Track1Controller(Node):
@@ -41,6 +46,35 @@ class Track1Controller(Node):
         self.seq = 0
         self.source = "node"
         self.task_id = int(time.time() * 1000)
+        self.pose = None
+        self.pose_topic = None
+
+        lidar_qos = QoSProfile(
+            depth=10,
+            reliability=QoSReliabilityPolicy.BEST_EFFORT,
+        )
+        reliable_lidar_qos = QoSProfile(
+            depth=10,
+            reliability=QoSReliabilityPolicy.RELIABLE,
+            durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
+        )
+        self.create_subscription(
+            Odometry, "/slam/lidar_loc",
+            lambda msg: self.odometry_callback(msg, "/slam/lidar_loc"),
+            qos_profile=lidar_qos)
+        self.create_subscription(
+            Odometry, "/slam/lidar_odom",
+            lambda msg: self.odometry_callback(msg, "/slam/lidar_odom"),
+            qos_profile=reliable_lidar_qos)
+
+    def odometry_callback(self, msg, topic):
+        pose = msg.pose.pose
+        self.pose = (
+            pose.position.x,
+            pose.position.y,
+            quaternion_to_yaw(pose.orientation),
+        )
+        self.pose_topic = topic
 
     def set_mode(self, action_desc):
         if not self.mode_client.wait_for_service(timeout_sec=5.0):
@@ -120,6 +154,111 @@ class Track1Controller(Node):
             time.sleep(0.02)
         self.stop()
 
+    def wait_for_pose(self, timeout):
+        deadline = time.monotonic() + timeout
+        while rclpy.ok() and time.monotonic() < deadline:
+            rclpy.spin_once(self, timeout_sec=0.1)
+            if self.pose is not None:
+                self.get_logger().info(
+                    "Using localization from %s: x=%.3f y=%.3f yaw=%.3f",
+                    self.pose_topic, self.pose[0], self.pose[1], self.pose[2])
+                return True
+        self.get_logger().warning("No localization pose received")
+        return False
+
+    def drive_to_pose_closed_loop(
+            self, target_x, target_y, target_yaw, pos_tol, yaw_tol,
+            max_forward, max_lateral, max_angular, timeout,
+            no_progress_timeout, progress_epsilon, axis_switch_tolerance):
+        deadline = time.monotonic() + timeout
+        last_log = 0.0
+        best_distance = None
+        best_distance_time = time.monotonic()
+
+        while rclpy.ok() and time.monotonic() < deadline:
+            rclpy.spin_once(self, timeout_sec=0.02)
+            if self.pose is None:
+                self.stop(repeats=1)
+                continue
+
+            x, y, yaw = self.pose
+            dx = target_x - x
+            dy = target_y - y
+            distance = math.hypot(dx, dy)
+
+            if distance <= pos_tol:
+                self.stop()
+                break
+
+            now = time.monotonic()
+            if best_distance is None or distance < best_distance - progress_epsilon:
+                best_distance = distance
+                best_distance_time = now
+            elif now - best_distance_time > no_progress_timeout:
+                self.stop()
+                self.get_logger().error(
+                    "No progress toward I1 for %.1fs. "
+                    "Stopping to avoid pushing into a wall. "
+                    "Current dist=%.3f, best dist=%.3f",
+                    no_progress_timeout, distance, best_distance)
+                return False
+
+            forward_error = math.cos(yaw) * dx + math.sin(yaw) * dy
+            lateral_error = -math.sin(yaw) * dx + math.cos(yaw) * dy
+
+            forward = 0.0
+            lateral = 0.0
+            if abs(lateral_error) > axis_switch_tolerance:
+                lateral = command_from_error(
+                    lateral_error, gain=0.35, min_abs=0.20, max_abs=max_lateral)
+            elif abs(forward_error) > axis_switch_tolerance:
+                forward = command_from_error(
+                    forward_error, gain=0.35, min_abs=0.20, max_abs=max_forward)
+            else:
+                forward = command_from_error(
+                    forward_error, gain=0.25, min_abs=0.20, max_abs=max_forward)
+                lateral = command_from_error(
+                    lateral_error, gain=0.25, min_abs=0.20, max_abs=max_lateral)
+
+            self.publish_velocity(forward=forward, lateral=lateral)
+            if now - last_log > 1.0:
+                self.get_logger().info(
+                    "Approaching I1: dist=%.3f forward_err=%.3f "
+                    "lateral_err=%.3f cmd=(%.2f, %.2f)",
+                    distance, forward_error, lateral_error, forward, lateral)
+                last_log = now
+            time.sleep(0.02)
+        else:
+            self.get_logger().warning("Position control timed out")
+
+        self.stop()
+        deadline = time.monotonic() + timeout
+        last_log = 0.0
+        while rclpy.ok() and time.monotonic() < deadline:
+            rclpy.spin_once(self, timeout_sec=0.02)
+            if self.pose is None:
+                self.stop(repeats=1)
+                continue
+
+            yaw_error = normalize_angle(target_yaw - self.pose[2])
+            if abs(yaw_error) <= yaw_tol:
+                self.stop()
+                return True
+
+            angular = command_from_error(
+                yaw_error, gain=0.65, min_abs=0.10, max_abs=max_angular)
+            self.publish_velocity(angular=angular)
+            now = time.monotonic()
+            if now - last_log > 1.0:
+                self.get_logger().info(
+                    "Aligning to I2: yaw_error=%.3f", yaw_error)
+                last_log = now
+            time.sleep(0.02)
+
+        self.get_logger().warning("Yaw control timed out")
+        self.stop()
+        return False
+
     def make_pnc_request(
             self, task_request, map_id, x=0.0, y=0.0, yaw=0.0,
             radius=0.1, pnc_mode=PNC_MODE_NORMAL, max_speed=0.25):
@@ -188,6 +327,29 @@ class Track1Controller(Node):
 node_for_signal = None
 
 
+def normalize_angle(angle):
+    return math.atan2(math.sin(angle), math.cos(angle))
+
+
+def quaternion_to_yaw(q):
+    siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
+    cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+    return math.atan2(siny_cosp, cosy_cosp)
+
+
+def clamp(value, low, high):
+    return max(low, min(high, value))
+
+
+def command_from_error(error, gain, min_abs, max_abs):
+    if abs(error) < 1e-6:
+        return 0.0
+    raw = clamp(gain * error, -max_abs, max_abs)
+    if 0.0 < abs(raw) < min_abs:
+        raw = math.copysign(min_abs, raw)
+    return raw
+
+
 def signal_handler(sig, _frame):
     if node_for_signal is not None:
         node_for_signal.get_logger().info(
@@ -212,9 +374,12 @@ def parse_args():
         help="Seconds to wait after Reset before switching to locomotion.")
     parser.add_argument(
         "--control-mode",
-        choices=("pnc", "velocity"),
-        default="pnc",
-        help="Use PNC goal navigation or timed velocity fallback.")
+        choices=("closed-loop", "pnc", "velocity"),
+        default="closed-loop",
+        help="Use odometry closed-loop control, PNC, or timed velocity fallback.")
+    parser.add_argument("--scene-start-x", type=float, default=SCENE_START_X)
+    parser.add_argument("--scene-start-y", type=float, default=SCENE_START_Y)
+    parser.add_argument("--scene-start-yaw", type=float, default=SCENE_START_YAW)
     parser.add_argument("--target-x", type=float, default=0.0)
     parser.add_argument("--target-y", type=float, default=1.7)
     parser.add_argument(
@@ -231,6 +396,16 @@ def parse_args():
         type=float,
         default=35.0,
         help="Seconds to keep publishing the PNC target.")
+    parser.add_argument("--pose-timeout", type=float, default=5.0)
+    parser.add_argument("--closed-loop-timeout", type=float, default=45.0)
+    parser.add_argument("--position-tolerance", type=float, default=0.08)
+    parser.add_argument("--yaw-tolerance", type=float, default=0.08)
+    parser.add_argument("--closed-loop-forward-speed", type=float, default=0.20)
+    parser.add_argument("--closed-loop-lateral-speed", type=float, default=0.20)
+    parser.add_argument("--closed-loop-angular-speed", type=float, default=0.25)
+    parser.add_argument("--axis-switch-tolerance", type=float, default=0.12)
+    parser.add_argument("--no-progress-timeout", type=float, default=2.5)
+    parser.add_argument("--progress-epsilon", type=float, default=0.03)
     parser.add_argument("--right-speed", type=float, default=0.2)
     parser.add_argument("--right-distance", type=float, default=1.5)
     parser.add_argument("--forward-speed", type=float, default=0.25)
@@ -268,6 +443,59 @@ def main():
         time.sleep(1.0)
 
         use_velocity_fallback = args.control_mode == "velocity"
+        if args.control_mode == "closed-loop":
+            if not node.register_input_source():
+                return
+
+            if node.wait_for_pose(args.pose_timeout):
+                start_x, start_y, start_yaw = node.pose
+                scene_dx = args.target_x - args.scene_start_x
+                scene_dy = args.target_y - args.scene_start_y
+                frame_yaw = normalize_angle(start_yaw - args.scene_start_yaw)
+                target_x = (
+                    start_x
+                    + math.cos(frame_yaw) * scene_dx
+                    - math.sin(frame_yaw) * scene_dy
+                )
+                target_y = (
+                    start_y
+                    + math.sin(frame_yaw) * scene_dx
+                    + math.cos(frame_yaw) * scene_dy
+                )
+                target_yaw = normalize_angle(
+                    start_yaw + args.target_yaw - args.scene_start_yaw)
+
+                node.get_logger().info(
+                    "Reset pose: x=%.3f y=%.3f yaw=%.3f; "
+                    "scene delta to I1=(%.3f, %.3f); "
+                    "closed-loop target: x=%.3f y=%.3f yaw=%.3f",
+                    start_x, start_y, start_yaw,
+                    scene_dx, scene_dy,
+                    target_x, target_y, target_yaw)
+                ok = node.drive_to_pose_closed_loop(
+                    target_x,
+                    target_y,
+                    target_yaw,
+                    args.position_tolerance,
+                    args.yaw_tolerance,
+                    args.closed_loop_forward_speed,
+                    args.closed_loop_lateral_speed,
+                    args.closed_loop_angular_speed,
+                    args.closed_loop_timeout,
+                    args.no_progress_timeout,
+                    args.progress_epsilon,
+                    args.axis_switch_tolerance,
+                )
+                node.set_mode("STAND_DEFAULT")
+                if ok:
+                    node.get_logger().info(
+                        "Closed-loop movement finished at I1 target pose")
+                return
+
+            node.get_logger().warning(
+                "Localization unavailable; falling back to timed velocity control.")
+            use_velocity_fallback = True
+
         if args.control_mode == "pnc":
             for _ in range(20):
                 rclpy.spin_once(node, timeout_sec=0.1)
