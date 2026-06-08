@@ -236,15 +236,16 @@ class WalkForwardSteps(Node):
         self.stop()
         self.log_pose(prefix="Heading aligned")
 
-    def drive_axis_to_target(self, axis_name, target_value, target_heading):
+    def drive_axis_to_target(self, axis_name, target_value, target_heading, forward_sign=1.0):
         self.last_pose_log_time = 0.0
         start_error = (
             target_value - self.y if axis_name == "y" else target_value - self.x
         )
         previous_error = start_error
+        motion_label = "backward" if forward_sign < 0.0 else "forward"
 
         self.get_logger().info(
-            f"Driving axis {axis_name} toward {target_value:.3f} with heading {math.degrees(target_heading):.1f} deg"
+            f"Driving axis {axis_name} toward {target_value:.3f} with heading {math.degrees(target_heading):.1f} deg, motion={motion_label}"
         )
 
         stop_reason = "tolerance"
@@ -270,7 +271,7 @@ class WalkForwardSteps(Node):
             forward = max(
                 self.min_distance_speed,
                 min(self.max_distance_speed, self.distance_kp * abs(error)),
-            )
+            ) * forward_sign
 
             self.publish_velocity(forward=forward, angular=angular)
             self.maybe_log_pose()
@@ -282,7 +283,7 @@ class WalkForwardSteps(Node):
         final_error = target_value - final_value
         self.get_logger().info(
             f"Segment finished on axis {axis_name}: value={final_value:.3f}, "
-            f"target={target_value:.3f}, error={final_error:.3f}, stop_reason={stop_reason}"
+            f"target={target_value:.3f}, error={final_error:.3f}, stop_reason={stop_reason}, motion={motion_label}"
         )
 
     def move_to_target(self):
@@ -295,13 +296,13 @@ class WalkForwardSteps(Node):
             f"Target point: x={self.target_x:.3f}, y={self.target_y:.3f}, dx={dx:.3f}, dy={dy:.3f}"
         )
 
-        if abs(dy) > self.position_tolerance:
-            y_heading = math.pi / 2.0 if dy >= 0.0 else -math.pi / 2.0
+        if abs(dx) > self.position_tolerance:
+            x_heading = 0.0 if dx >= 0.0 else math.pi
             self.get_logger().info(
-                f"Stage 1: correct y by {dy:.3f} m with heading {math.degrees(y_heading):.1f} deg"
+                f"Stage 1: correct x by {dx:.3f} m with heading {math.degrees(x_heading):.1f} deg"
             )
-            self.turn_to_heading(y_heading)
-            self.drive_axis_to_target("y", self.target_y, y_heading)
+            self.turn_to_heading(x_heading)
+            self.drive_axis_to_target("x", self.target_x, x_heading)
 
         dx_after = self.target_x - self.x
         dy_after = self.target_y - self.y
@@ -309,16 +310,19 @@ class WalkForwardSteps(Node):
             f"After stage 1: dx={dx_after:.3f}, dy={dy_after:.3f}"
         )
 
-        if abs(dx_after) > self.position_tolerance:
-            x_heading = 0.0 if dx_after >= 0.0 else math.pi
+        if abs(dy_after) > self.position_tolerance:
+            y_heading = -math.pi / 2.0 if dy_after >= 0.0 else math.pi / 2.0
             self.get_logger().info(
-                f"Stage 2: correct x by {dx_after:.3f} m with heading {math.degrees(x_heading):.1f} deg"
+                f"Stage 2: turn for reverse y segment by heading {math.degrees(y_heading):.1f} deg"
             )
-            self.turn_to_heading(x_heading)
-            self.drive_axis_to_target("x", self.target_x, x_heading)
+            self.turn_to_heading(y_heading)
+            self.get_logger().info(
+                f"Stage 3: correct y by {dy_after:.3f} m while moving backward"
+            )
+            self.drive_axis_to_target("y", self.target_y, y_heading, forward_sign=-1.0)
 
         self.get_logger().info(
-            f"Stage 3: turn to final heading {math.degrees(self.target_yaw):.1f} deg"
+            f"Stage 4: turn to final heading {math.degrees(self.target_yaw):.1f} deg"
         )
         self.turn_to_heading(self.target_yaw)
 
