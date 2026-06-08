@@ -168,9 +168,12 @@ class Track1Controller(Node):
 
     def drive_to_pose_closed_loop(
             self, target_x, target_y, target_yaw, pos_tol, yaw_tol,
-            max_forward, max_lateral, max_angular, timeout):
+            max_forward, max_lateral, max_angular, timeout,
+            no_progress_timeout, progress_epsilon, axis_switch_tolerance):
         deadline = time.monotonic() + timeout
         last_log = 0.0
+        best_distance = None
+        best_distance_time = time.monotonic()
 
         while rclpy.ok() and time.monotonic() < deadline:
             rclpy.spin_once(self, timeout_sec=0.02)
@@ -187,20 +190,42 @@ class Track1Controller(Node):
                 self.stop()
                 break
 
+            now = time.monotonic()
+            if best_distance is None or distance < best_distance - progress_epsilon:
+                best_distance = distance
+                best_distance_time = now
+            elif now - best_distance_time > no_progress_timeout:
+                self.stop()
+                self.get_logger().error(
+                    "No progress toward I1 for %.1fs. "
+                    "Stopping to avoid pushing into a wall. "
+                    "Current dist=%.3f, best dist=%.3f",
+                    no_progress_timeout, distance, best_distance)
+                return False
+
             forward_error = math.cos(yaw) * dx + math.sin(yaw) * dy
             lateral_error = -math.sin(yaw) * dx + math.cos(yaw) * dy
 
-            forward = command_from_error(
-                forward_error, gain=0.45, min_abs=0.20, max_abs=max_forward)
-            lateral = command_from_error(
-                lateral_error, gain=0.45, min_abs=0.20, max_abs=max_lateral)
+            forward = 0.0
+            lateral = 0.0
+            if abs(lateral_error) > axis_switch_tolerance:
+                lateral = command_from_error(
+                    lateral_error, gain=0.35, min_abs=0.20, max_abs=max_lateral)
+            elif abs(forward_error) > axis_switch_tolerance:
+                forward = command_from_error(
+                    forward_error, gain=0.35, min_abs=0.20, max_abs=max_forward)
+            else:
+                forward = command_from_error(
+                    forward_error, gain=0.25, min_abs=0.20, max_abs=max_forward)
+                lateral = command_from_error(
+                    lateral_error, gain=0.25, min_abs=0.20, max_abs=max_lateral)
 
             self.publish_velocity(forward=forward, lateral=lateral)
-            now = time.monotonic()
             if now - last_log > 1.0:
                 self.get_logger().info(
-                    "Approaching I1: dist=%.3f forward_err=%.3f lateral_err=%.3f",
-                    distance, forward_error, lateral_error)
+                    "Approaching I1: dist=%.3f forward_err=%.3f "
+                    "lateral_err=%.3f cmd=(%.2f, %.2f)",
+                    distance, forward_error, lateral_error, forward, lateral)
                 last_log = now
             time.sleep(0.02)
         else:
@@ -375,9 +400,12 @@ def parse_args():
     parser.add_argument("--closed-loop-timeout", type=float, default=45.0)
     parser.add_argument("--position-tolerance", type=float, default=0.08)
     parser.add_argument("--yaw-tolerance", type=float, default=0.08)
-    parser.add_argument("--closed-loop-forward-speed", type=float, default=0.25)
-    parser.add_argument("--closed-loop-lateral-speed", type=float, default=0.25)
-    parser.add_argument("--closed-loop-angular-speed", type=float, default=0.35)
+    parser.add_argument("--closed-loop-forward-speed", type=float, default=0.20)
+    parser.add_argument("--closed-loop-lateral-speed", type=float, default=0.20)
+    parser.add_argument("--closed-loop-angular-speed", type=float, default=0.25)
+    parser.add_argument("--axis-switch-tolerance", type=float, default=0.12)
+    parser.add_argument("--no-progress-timeout", type=float, default=2.5)
+    parser.add_argument("--progress-epsilon", type=float, default=0.03)
     parser.add_argument("--right-speed", type=float, default=0.2)
     parser.add_argument("--right-distance", type=float, default=1.5)
     parser.add_argument("--forward-speed", type=float, default=0.25)
@@ -438,8 +466,11 @@ def main():
                     start_yaw + args.target_yaw - args.scene_start_yaw)
 
                 node.get_logger().info(
-                    "Closed-loop target in localization frame: "
-                    "x=%.3f y=%.3f yaw=%.3f",
+                    "Reset pose: x=%.3f y=%.3f yaw=%.3f; "
+                    "scene delta to I1=(%.3f, %.3f); "
+                    "closed-loop target: x=%.3f y=%.3f yaw=%.3f",
+                    start_x, start_y, start_yaw,
+                    scene_dx, scene_dy,
                     target_x, target_y, target_yaw)
                 ok = node.drive_to_pose_closed_loop(
                     target_x,
@@ -451,6 +482,9 @@ def main():
                     args.closed_loop_lateral_speed,
                     args.closed_loop_angular_speed,
                     args.closed_loop_timeout,
+                    args.no_progress_timeout,
+                    args.progress_epsilon,
+                    args.axis_switch_tolerance,
                 )
                 node.set_mode("STAND_DEFAULT")
                 if ok:
