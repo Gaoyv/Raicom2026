@@ -27,6 +27,8 @@ class WalkForwardSteps(Node):
         distance_kp,
         heading_kp,
         pose_log_interval,
+        segment_timeout_sec,
+        final_turn_timeout_sec,
     ):
         super().__init__("walk_forward_steps")
         self.publisher = self.create_publisher(
@@ -59,6 +61,8 @@ class WalkForwardSteps(Node):
         self.distance_kp = float(distance_kp)
         self.heading_kp = float(heading_kp)
         self.pose_log_interval = float(pose_log_interval)
+        self.segment_timeout_sec = float(segment_timeout_sec)
+        self.final_turn_timeout_sec = float(final_turn_timeout_sec)
         self.last_pose_log_time = 0.0
 
         self.max_heading_correction = 0.35
@@ -210,16 +214,24 @@ class WalkForwardSteps(Node):
             angle += 2.0 * math.pi
         return angle
 
-    def turn_to_heading(self, target_heading):
+    def turn_to_heading(self, target_heading, timeout_sec=None):
         self.last_pose_log_time = 0.0
+        if timeout_sec is None:
+            timeout_sec = self.final_turn_timeout_sec
+        deadline = time.monotonic() + timeout_sec
         self.get_logger().info(
             f"Turning to heading {math.degrees(target_heading):.1f} deg"
         )
 
+        stop_reason = "tolerance"
         while rclpy.ok():
             rclpy.spin_once(self, timeout_sec=0.02)
             error = self.normalize_angle(target_heading - self.yaw)
             if abs(error) <= self.angle_tolerance:
+                stop_reason = "tolerance"
+                break
+            if time.monotonic() >= deadline:
+                stop_reason = "timeout"
                 break
 
             angular = max(
@@ -234,7 +246,7 @@ class WalkForwardSteps(Node):
             time.sleep(0.02)
 
         self.stop()
-        self.log_pose(prefix="Heading aligned")
+        self.log_pose(prefix=f"Heading aligned ({stop_reason})")
 
     def drive_axis_to_target(self, axis_name, target_value, target_heading, forward_sign=1.0):
         self.last_pose_log_time = 0.0
@@ -249,6 +261,7 @@ class WalkForwardSteps(Node):
         )
 
         stop_reason = "tolerance"
+        deadline = time.monotonic() + self.segment_timeout_sec
         while rclpy.ok():
             rclpy.spin_once(self, timeout_sec=0.02)
 
@@ -263,15 +276,29 @@ class WalkForwardSteps(Node):
                 stop_reason = "crossing"
                 break
 
+            if time.monotonic() >= deadline:
+                stop_reason = "timeout"
+                break
+
             heading_error = self.normalize_angle(target_heading - self.yaw)
             angular = max(
                 -self.max_heading_correction,
                 min(self.max_heading_correction, self.heading_kp * heading_error),
             )
-            forward = max(
+            speed_magnitude = max(
                 self.min_distance_speed,
                 min(self.max_distance_speed, self.distance_kp * abs(error)),
-            ) * forward_sign
+            )
+            forward = speed_magnitude * forward_sign
+
+            if axis_name == "x":
+                predicted_delta = math.cos(target_heading) * forward
+            else:
+                predicted_delta = math.sin(target_heading) * forward
+
+            if error * predicted_delta < 0.0:
+                forward = -forward
+                motion_label = "backward" if forward < 0.0 else "forward"
 
             self.publish_velocity(forward=forward, angular=angular)
             self.maybe_log_pose()
@@ -419,6 +446,18 @@ def _parse_args():
         help="Proportional gain for heading control",
     )
     parser.add_argument(
+        "--segment-timeout-sec",
+        type=float,
+        default=12.0,
+        help="Maximum seconds allowed for each translation segment before stopping it",
+    )
+    parser.add_argument(
+        "--final-turn-timeout-sec",
+        type=float,
+        default=8.0,
+        help="Maximum seconds allowed for the final heading turn",
+    )
+    parser.add_argument(
         "--pose-log-interval",
         type=float,
         default=0.5,
@@ -443,6 +482,8 @@ def main():
         args.distance_kp,
         args.heading_kp,
         args.pose_log_interval,
+        args.segment_timeout_sec,
+        args.final_turn_timeout_sec,
     )
     _global_node = node
 
