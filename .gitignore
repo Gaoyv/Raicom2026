@@ -1,0 +1,9 @@
+# Python 缓存
+__pycache__/
+*.py[cod]
+
+# 启动脚本生成的容器内中转启动器
+.raicom/
+
+# 运行日志
+*.log
